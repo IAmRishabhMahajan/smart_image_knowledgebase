@@ -1,0 +1,25 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+requests
+Pillow
+exifread
+
+# Redis + search
+redis>4
+redisearch
+
+# CLIP (OpenCLIP)
+torch
+torchvision
+open_clip_torch
+numpy
+
+# InsightFace (detector + embeddings)
+insightface==0.7.3
+onnxruntime
+
+# Utility
+tqdm
+python-multipart
