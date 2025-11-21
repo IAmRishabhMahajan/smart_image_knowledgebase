@@ -23,3 +23,7 @@ onnxruntime
 # Utility
 tqdm
 python-multipart
+
+
+
+opencv-python-headless

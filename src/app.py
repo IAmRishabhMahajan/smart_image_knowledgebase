@@ -1,74 +1,130 @@
-import os, tempfile
-from typing import List, Dict, Any
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from pydantic import BaseModel
+# src/app.py
+
+import os
+from typing import List, Optional
+
 import numpy as np
+from fastapi import FastAPI
+from pydantic import BaseModel
 
 from .ingest_images import incremental_ingest
-from .face_store import ingest_faces, list_unlabeled, label_face, search_face_by_upload
-from .redis_index import get_client, knn_images, ensure_images_schema
-from .utils import ollama_vision
+from .face_store import ingest_faces, list_unlabeled, label_face
+from .redis_index import get_client, knn_images
+
+import torch
+import open_clip
+
+app = FastAPI(title="Smart Image Knowledgebase")
 
 PHOTOS_DIR = os.getenv("PHOTOS_DIR", "/app/data/photos")
-IMAGE_EMBED_DIM = int(os.getenv("IMAGE_EMBED_DIM", "512"))
 
-app = FastAPI(title="Smart Image Knowledgebase", version="0.1.0")
 
-class IngestReport(BaseModel):
-    added: int
-    skipped: int
+# ========== CLIP text encoder for queries ==========
 
-class QueryText(BaseModel):
+class TextEncoder:
+    def __init__(self) -> None:
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model, _, _ = open_clip.create_model_and_transforms(
+            "ViT-B-32", pretrained="openai", device=self.device
+        )
+        self.tokenizer = open_clip.get_tokenizer("ViT-B-32")
+
+    @torch.no_grad()
+    def encode(self, text: str) -> np.ndarray:
+        tokens = self.tokenizer([text]).to(self.device)
+        z = self.model.encode_text(tokens)
+        z = z / z.norm(dim=-1, keepdim=True)
+        return z.squeeze(0).cpu().float().numpy()
+
+
+text_encoder = TextEncoder()
+
+
+# ========== Pydantic models ==========
+
+class QueryTextRequest(BaseModel):
     question: str
-    k: int = 6
-    tag_filter: str | None = None
-    describe_with_llm: bool = True
+     # kept for later, currently ignored
+
+
+# ========== API endpoints ==========
 
 @app.get("/health")
 def health():
-    return {"status":"ok"}
+    return {"status": "ok"}
 
-@app.post("/ingest_images", response_model=IngestReport)
-def ingest_images():
+
+@app.post("/ingest_images")
+def ingest_images_endpoint():
     res = incremental_ingest()
-    return IngestReport(**res)
+    return res
+
 
 @app.post("/ingest_faces")
-def ingest_faces_api():
+def ingest_faces_endpoint():
     res = ingest_faces()
     return res
 
+
 @app.get("/faces/unlabeled")
-def faces_unlabeled(limit: int = 50):
+def faces_unlabeled(limit: int = 20):
     return {"faces": list_unlabeled(limit=limit)}
 
+
 @app.post("/label_face")
-def label_face_api(face_id: str = Form(...), person: str = Form(...), propagate: bool = Form(True)):
-    return label_face(face_id, person, propagate=propagate)
+def label_face_endpoint(face_id: str, person: str, propagate: bool = True):
+    res = label_face(face_id, person, propagate=propagate)
+    return res
+
 
 @app.post("/query_text")
-def query_text(req: QueryText):
-    # Use CLIP text->image retrieval stored in Redis (vector field)
-    client = get_client()
-    ensure_images_schema(client, dim=IMAGE_EMBED_DIM)  # idempotent
-    # we reuse the text as a tag filter first if provided, else pure knn
-    # For KNN, we need a vector; simplest approach here: let Pixtral describe top images for question
-    # For robust KNN by text, add CLIP text encoder; to keep this endpoint light, we rely on tags + LLM
-    # Hybrid: If tag_filter provided, use it; otherwise, just describe best candidates
-    # We'll just ask LLM to answer using the top retrieved images by tags (if any), else all images (not ideal at scale).
-    hits = knn_images(client, query_vec=(0*np.zeros((1,IMAGE_EMBED_DIM),dtype="float32")+1e-6), k=req.k, tag_filter=req.tag_filter)  # dummy vec; RediSearch requires a vector param
-    paths = [os.path.join(PHOTOS_DIR, h["path"]) for h in hits if "path" in h]
-    if req.describe_with_llm and paths:
-        resp = ollama_vision(f"Answer the question using these images. Question: {req.question}", paths[:4])
-        return {"answer": resp, "images": hits[:4]}
-    return {"images": hits}
+def query_text(req: QueryTextRequest):
+    """
+    Smart unified search:
+      - Detect person names inside query
+      - Detect tags
+      - Run CLIP text embedding
+      - Return ONLY image hits (no metadata about detection)
+    """
 
-@app.post("/query_image")
-def query_image(question: str = Form("Describe this image"), file: UploadFile = File(...)):
-    # Save upload temporarily
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        tmp.write(file.file.read())
-        tmp_path = tmp.name
-    # Send uploaded image + question to Pixtral
-    resp = ollama_vision(question, [tmp_path])
-    return {"answer": resp}
+    query = req.question
+    client = get_client()
+
+    # ===== 1. Detect known person names =====
+    known_people = set()
+    for key in client.scan_iter(match="face:*"):
+        p = client.hget(key, "person")
+        if p:
+            p = p.decode().strip().lower()
+            if p:
+                known_people.add(p)
+
+    q_lower = query.lower()
+    persons_in_query = [p for p in known_people if p in q_lower]
+    person_filter = persons_in_query[0] if persons_in_query else None
+
+
+    # ===== 2. Detect scene tags =====
+    SCENE_TAGS = [
+        "hill","mountain","sunset","beach","forest","night","day",
+        "selfie","outdoor","indoor","people","friends","snow","city"
+    ]
+    matched_tags = [t for t in SCENE_TAGS if t in q_lower]
+    tag_filter = matched_tags[0] if matched_tags else None
+
+
+    # ===== 3. CLIP embedding =====
+    vec = text_encoder.encode(query)
+
+
+    # ===== 4. Perform KNN search =====
+    results = knn_images(
+        client,
+        vec.reshape(1, -1),
+        k=8,
+        tag_filter=tag_filter,
+        person_filter=person_filter,
+    )
+
+    # ===== 5. Return **images only** =====
+    return {"results": results}
