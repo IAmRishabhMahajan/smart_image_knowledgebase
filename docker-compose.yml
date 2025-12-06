@@ -5,12 +5,10 @@ services:
     image: ollama/ollama
     container_name: ollama_smart_image_knowledgebase
     ports:
-      - "11435:11434"        # host:container
+      - "11435:11434"
     volumes:
       - ollama_models:/root/.ollama
       - ./start_ollama.sh:/start_ollama.sh
-    environment:
-      - OLLAMA_MODEL=llava:13b
     entrypoint: ["/bin/bash", "/start_ollama.sh"]
     restart: unless-stopped
 
@@ -19,7 +17,7 @@ services:
     container_name: redis
     ports:
       - "6379:6379"
-      - "8001:8001"          # optional Redis-Stack UI
+      - "8001:8001"
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -34,7 +32,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - OLLAMA_HOST=http://ollama_smart_image_knowledgebase:11434
-      - OLLAMA_MODEL=pixtral
+      - VISION_MODEL=llava
       - CLIP_MODEL=ViT-B-32
       - CLIP_PRETRAINED=openai
       - PHOTOS_DIR=/app/data/photos
@@ -46,9 +44,26 @@ services:
       - ./data:/app/data
       - ./vectorstore:/app/vectorstore
       - ./src:/app/src
+      - ./streamlit_app.py:/app/streamlit_app.py
     ports:
       - "8009:8000"
     command: uvicorn src.app:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+
+  streamlit:
+    build: .
+    container_name: spk_streamlit
+    depends_on:
+      - app
+    environment:
+      - API_BASE=http://app:8000
+      - PHOTOS_DIR=/app/data/photos
+    volumes:
+      - ./data:/app/data
+      - ./streamlit_app.py:/app/streamlit_app.py
+    ports:
+      - "8501:8501"
+    command: streamlit run streamlit_app.py --server.address=0.0.0.0 --server.port=8501
     restart: unless-stopped
 
 volumes:

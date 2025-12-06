@@ -1,6 +1,11 @@
 #!/bin/bash
 set -e
+
+# Start Ollama server
 ollama serve &
 sleep 8
-ollama pull ${OLLAMA_MODEL:-pixtral} || true
+
+# Pull a REAL vision model
+ollama pull llava || true
+
 wait
